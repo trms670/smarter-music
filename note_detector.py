@@ -6,6 +6,14 @@ import time
 from collections import deque
 
 from score import expected
+from score_follower import follower
+
+# ------------------------
+# Matcher mode
+# "hmm"        — HMM beam-search follower (robust, any start position)
+# "sequential" — strict left-to-right index matcher (original behaviour)
+# ------------------------
+MODE = "hmm"
 
 # ------------------------
 # Audio params
@@ -27,6 +35,13 @@ pitch_o.set_silence(-40)
 onset_o = aubio.onset("complex", BUFFER_SIZE, HOP_SIZE, SAMPLE_RATE)
 onset_o.set_threshold(0.3)
 onset_o.set_minioi_ms(200)  # suppress re-triggers within 200 ms (covers secondary bow energy peaks)
+
+# ------------------------
+# Input device
+# Set to None to use the system default, or set to a device name/index.
+# Run: python -c "import sounddevice as sd; print(sd.query_devices())" to list devices.
+# ------------------------
+DEVICE = 0
 
 # ------------------------
 # Detection thresholds
@@ -78,28 +93,40 @@ def on_note_event(midi_est: float, onset_time: float):
     """Called once per detected onset with a stable pitch estimate."""
     global idx
 
-    if idx >= len(expected):
-        return
+    heard = midi_to_name(int(round(midi_est)))
 
-    midi_round = int(round(midi_est))
-    exp        = expected[idx]
-    exp_midi   = int(exp["pitches_midi"][0])
-    exp_name   = exp["pitches_name"][0]
-    diff       = abs(midi_est - exp_midi)
-
-    heard_name = midi_to_name(midi_round)
-
-    if diff <= PITCH_TOL_SEMITONES:
+    if MODE == "hmm":
+        result   = follower.observe(midi_est, onset_time)
+        exp      = expected[result["idx"]]
+        exp_name = exp["pitches_name"][0]
+        conf_pct = int(result["confidence"] * 100)
+        conf_bar = "█" * (conf_pct // 10) + "░" * (10 - conf_pct // 10)
+        status   = "LOCK" if result["locked"] else "srch"
         print(
-            f"  MATCH  idx={idx:3d}  measure={exp['measure']}  beat={exp['beat']}"
-            f"  expected={exp_name:<4s}  heard={heard_name:<4s}"
+            f"  [{status}] m{result['measure']:2d} b{result['beat']:.1f}"
+            f"  exp={exp_name:<4s}  heard={heard:<4s}"
+            f"  conf={conf_pct:3d}% {conf_bar}"
+            f"  ~{result['bpm']:.0f} BPM"
         )
-        idx += 1
-    else:
-        print(
-            f"  MISS   idx={idx:3d}  measure={exp['measure']}  beat={exp['beat']}"
-            f"  expected={exp_name:<4s}  heard={heard_name:<4s}"
-        )
+
+    else:  # sequential
+        if idx >= len(expected):
+            return
+        exp      = expected[idx]
+        exp_midi = int(exp["pitches_midi"][0])
+        exp_name = exp["pitches_name"][0]
+        diff     = abs(midi_est - exp_midi)
+        if diff <= PITCH_TOL_SEMITONES:
+            print(
+                f"  MATCH  idx={idx:3d}  measure={exp['measure']}  beat={exp['beat']}"
+                f"  expected={exp_name:<4s}  heard={heard:<4s}"
+            )
+            idx += 1
+        else:
+            print(
+                f"  MISS   idx={idx:3d}  measure={exp['measure']}  beat={exp['beat']}"
+                f"  expected={exp_name:<4s}  heard={heard:<4s}"
+            )
 
 # ------------------------
 # Audio callback
@@ -180,21 +207,36 @@ def audio_callback(indata, frames, time_info, status):
 # Main
 # ------------------------
 if __name__ == "__main__":
-    print(f"Score loaded: {len(expected)} note events\n")
-    print("Starting onset-based pitch detection + sequential alignment.")
-    print("Play the melody from the beginning. Press Ctrl+C to stop.\n")
+    device_info = sd.query_devices(DEVICE) if DEVICE is not None else sd.query_devices(kind="input")
+    print(f"Microphone: {device_info['name']}  ({int(device_info['default_samplerate'])} Hz, "
+          f"{device_info['max_input_channels']} ch)")
+    print(f"Score loaded: {len(expected)} note events")
+    if MODE == "hmm":
+        print("Mode: HMM — play from any measure, jump freely.")
+        print("Columns: measure · beat · expected · heard · confidence · tempo")
+    else:
+        print("Mode: sequential — play from the beginning in order.")
+        print("Columns: idx · measure · beat · expected · heard")
+    print("Press Ctrl+C to stop.\n")
 
     try:
         with sd.InputStream(
+            device=DEVICE,
             channels=1,
             samplerate=SAMPLE_RATE,
             blocksize=HOP_SIZE,
             callback=audio_callback,
         ):
-            while idx < len(expected):
-                time.sleep(0.05)
-
-        print("\nDone — reached end of expected note list.")
+            if MODE == "sequential":
+                while idx < len(expected):
+                    time.sleep(0.05)
+                print("\nDone — reached end of score.")
+            else:
+                while True:
+                    time.sleep(0.05)
 
     except KeyboardInterrupt:
-        print(f"\nStopped at note index {idx} / {len(expected)}.")
+        if MODE == "sequential":
+            print(f"\nStopped at note index {idx} / {len(expected)}.")
+        else:
+            print("\nStopped.")
