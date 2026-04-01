@@ -28,6 +28,7 @@ Robustness
 """
 
 import threading
+from collections import deque
 from typing import Optional
 
 import numpy as np
@@ -41,13 +42,13 @@ SIGMA_PITCH     = 1.0     # semitone width for pitch emission
 
 USE_IOI         = True    # weight by inter-onset interval as well as pitch
 IOI_WEIGHT      = 0.6     # scale factor applied to IOI log-prob (pitch weight = 1.0)
-SIGMA_IOI_REL   = 0.25    # IOI sigma as fraction of expected IOI (tighter = 0.20,
+SIGMA_IOI_REL   = 0.20    # IOI sigma as fraction of expected IOI (tighter = 0.20,
                            #   looser = 0.40; use ~0.20 with fixed BPM, ~0.35 adaptive)
 SIGMA_IOI_FLOOR = 0.07    # minimum IOI sigma in seconds (floor for very short notes)
 
 # Tempo — set FIXED_BPM to a number to lock tempo (e.g. 108.0 for a metronome demo).
 # Set to None to use the adaptive EMA tracker.
-FIXED_BPM       = None    # e.g. 108.0
+FIXED_BPM       = 90.0    # e.g. 108.0
 INIT_BPM        = 100.0   # starting tempo when adaptive (or as FIXED_BPM fallback)
 TEMPO_ALPHA     = 0.20    # EMA weight for adaptive updates (lower = smoother)
 
@@ -61,6 +62,15 @@ SILENCE_RESET_S    = 5.0  # gap ≥ this → full hard reset
 DISPLAY_MIN_CONF = 0.55
 
 LOG_CONF_THRESH  = -20.0  # best raw log-prob below this → inject global beams
+
+# N-gram context window: retroactively score the last CONTEXT_SIZE-1 observations
+# against expected notes before the candidate state, weighted by CONTEXT_DECAY^k.
+# Example with CONTEXT_SIZE=3, DECAY=0.5:
+#   score(ns) += 0.5 * pitch_lp(obs[-2], ns-1) + 0.25 * pitch_lp(obs[-3], ns-2)
+# This makes sequences like (D5→G4→A4) far more unique than D5 alone.
+CONTEXT_SIZE   = 3    # number of recent notes used (1 = current only, no context)
+CONTEXT_DECAY  = 0.5  # weight halves per step back in history
+CONTEXT_WEIGHT = 0.8  # overall scale on context log-prob (pitch weight = 1.0)
 
 # ─── Transition model ──────────────────────────────────────────────────────────
 # (delta_steps, unnormalised_weight)
@@ -155,6 +165,9 @@ class ScoreFollower:
         # Confidence-gated display state
         self._display_idx: int = _NO_PREV   # -1 until first confident lock
 
+        # Sliding window of recent MIDI observations for N-gram context scoring
+        self._obs_buf: deque = deque(maxlen=CONTEXT_SIZE)
+
     # ── Public API ─────────────────────────────────────────────────────────────
 
     def reset(self) -> None:
@@ -202,12 +215,16 @@ class ScoreFollower:
             top_idx     = np.argsort(log_emit)[-self._k:][::-1]
             self._beams = [[int(i), float(log_emit[i]), _NO_PREV] for i in top_idx]
             self._ready = True
+            self._obs_buf.append(midi_est)
             return self._build_report()
 
-        # Soft reset: inject global hypotheses before expansion so the model can
-        # jump to wherever the performer restarted, then fall through to normal update.
+        # Soft reset: past context is stale — clear it, then widen the beam.
         if soft_reset:
+            self._obs_buf.clear()
             self._inject_global(midi_est)
+
+        # Add current observation to the context buffer (after clearing if needed)
+        self._obs_buf.append(midi_est)
 
         # Beam expansion
         # candidates[next_state] = [best_total_log_prob, best_prev_state]
@@ -218,11 +235,12 @@ class ScoreFollower:
                 ns = state + delta
                 if not (0 <= ns < self._n):
                     continue
-                p_lp  = _pitch_lp_state(midi_est, ns)
+                p_lp   = _pitch_lp_state(midi_est, ns)
+                ctx_lp = self._context_lp(ns)
                 # Skip IOI after a soft reset: the gap was a pause, not a note duration
-                i_lp  = (self._ioi_lp(obs_ioi, state, delta)
-                         if (USE_IOI and obs_ioi > 0 and not soft_reset) else 0.0)
-                total = lp + trans_lp + p_lp + IOI_WEIGHT * i_lp
+                i_lp   = (self._ioi_lp(obs_ioi, state, delta)
+                          if (USE_IOI and obs_ioi > 0 and not soft_reset) else 0.0)
+                total  = lp + trans_lp + p_lp + CONTEXT_WEIGHT * ctx_lp + IOI_WEIGHT * i_lp
                 if ns not in candidates or candidates[ns][0] < total:
                     candidates[ns] = [total, state]
 
@@ -249,6 +267,34 @@ class ScoreFollower:
                     self._tempo.update(obs_ioi, dur_q)
 
         return self._build_report()
+
+    # ── N-gram context emission ────────────────────────────────────────────────
+
+    def _context_lp(self, ns: int) -> float:
+        """
+        Retroactive context score for candidate state ns.
+
+        For each past observation in _obs_buf (oldest first, newest = current),
+        score it against the expected note k steps before ns, weighted by
+        CONTEXT_DECAY^k.  The current observation itself is NOT included here —
+        it is already counted as p_lp in the caller.
+
+        Example (CONTEXT_SIZE=3, DECAY=0.5):
+            score += 0.50 * pitch_lp(obs[-2], ns-1)
+            score += 0.25 * pitch_lp(obs[-3], ns-2)
+        """
+        if CONTEXT_SIZE <= 1 or len(self._obs_buf) < 2:
+            return 0.0
+        total  = 0.0
+        weight = CONTEXT_DECAY
+        obs    = list(self._obs_buf)   # oldest → newest; obs[-1] = current note
+        for k in range(1, len(obs)):   # k steps back
+            past_s = ns - k
+            if past_s < 0:
+                break
+            total  += weight * _pitch_lp_state(obs[-(k + 1)], past_s)
+            weight *= CONTEXT_DECAY
+        return total
 
     # ── IOI emission ───────────────────────────────────────────────────────────
 
@@ -321,6 +367,7 @@ class ScoreFollower:
         self._ready       = False
         self._last_ts     = None
         self._display_idx = _NO_PREV
+        self._obs_buf.clear()
         init_bpm = FIXED_BPM if FIXED_BPM is not None else INIT_BPM
         self._tempo       = _Tempo(init_bpm)
 

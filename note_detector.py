@@ -34,7 +34,7 @@ pitch_o.set_silence(-40)
 # ------------------------
 onset_o = aubio.onset("complex", BUFFER_SIZE, HOP_SIZE, SAMPLE_RATE)
 onset_o.set_threshold(0.3)
-onset_o.set_minioi_ms(200)  # suppress re-triggers within 200 ms (covers secondary bow energy peaks)
+onset_o.set_minioi_ms(250)  # minimum gap between aubio onsets; 250 ms is safe for 8th notes at 100+ BPM
 
 # ------------------------
 # Input device
@@ -51,16 +51,32 @@ MIN_CONFIDENCE      = 0.75
 MIN_FREQ            = 180   # violin low G ~196 Hz; a little headroom below
 MAX_FREQ            = 1400  # ~E6
 
-# Frames to wait after an onset before reading pitch (lets the attack transient settle)
-PITCH_LOOKAHEAD_FRAMES = 2
+# Frames to wait after an onset before reading pitch (lets the attack transient settle).
+# 3 frames × (512/44100) ≈ 35 ms — enough to clear most violin attack transients.
+PITCH_LOOKAHEAD_FRAMES = 3
 
-# Pitch-change detection (catches slurred notes with no onset spike)
+# Within the lookahead window, reject the note if pitch readings are still spread
+# out (std dev > threshold semitones) — we're likely still in the attack transient.
+PITCH_STABILITY_TOL = 0.8 
+
+# If the detected pitch is an octave off from the last confirmed note, print a warning.
+# YIN occasionally locks onto an octave harmonic; this makes it visible in the log.
+HARMONIC_WARN = True
+
+# Pitch-change detection (catches slurred notes with no onset spike).
+# Raise PITCH_STABLE_FRAMES if the slur detector fires too eagerly on vibrato.
 PITCH_CHANGE_THRESHOLD  = 1.2   # semitones — above vibrato range (~0.5 st), below a half step
-PITCH_STABLE_FRAMES     = 4     # frames the new pitch must hold before confirming a slurred note
+PITCH_STABLE_FRAMES     = 6     # frames new pitch must hold before confirming (70 ms at 44100/512).
 
-# Cooldown after a note event fires — blocks both detectors to prevent double-triggers
-# 10 frames * (512 / 44100) ≈ 116 ms; fast enough for quick passages, long enough to debounce
-COOLDOWN_FRAMES = 15
+# Cooldown after a note event fires — blocks both detectors to prevent double-triggers.
+# 18 frames × (512/44100) ≈ 209 ms post-note = ~244 ms post-onset total.
+# Safe for 8th notes at 108 BPM (next onset ≥ 278 ms after previous onset).
+COOLDOWN_FRAMES = 18
+
+# Same-pitch time gate: if a new onset produces the same pitch as the last confirmed
+# note and arrives within this window, it is almost certainly a bow re-trigger rather
+# than a real new note.  Set to 0.0 to disable.
+SAME_PITCH_GATE_S = 0.28   # seconds — just above one 8th note at 108 BPM
 
 # ------------------------
 # Utilities
@@ -75,9 +91,12 @@ def midi_to_name(m: int) -> str:
 # ------------------------
 # State
 # ------------------------
-idx                = 0        # current position in expected note list
-frames_since_onset = None     # None = not waiting; int = frames elapsed since last onset
-pending_onset_time = None     # wall-clock time of the last onset (for future tempo use)
+idx                  = 0        # current position in expected note list (sequential mode)
+frames_since_onset   = None     # None = not waiting; int = frames elapsed since last onset
+pending_onset_time   = None     # wall-clock time of the last onset
+pending_onset_conf   = None     # aubio confidence at the onset frame (used for harmonic check)
+last_confirmed_midi  = None     # MIDI of the last successfully confirmed note event
+last_confirmed_time  = None     # wall-clock time of the last confirmed note event
 
 # Ring buffer of recent (f0, confidence) readings to average across lookahead window
 pitch_history = deque(maxlen=PITCH_LOOKAHEAD_FRAMES + 1)
@@ -132,7 +151,9 @@ def on_note_event(midi_est: float, onset_time: float):
 # Audio callback
 # ------------------------
 def audio_callback(indata, frames, time_info, status):
-    global idx, frames_since_onset, pending_onset_time, current_semitone, pitch_change_count, cooldown_remaining
+    global idx, frames_since_onset, pending_onset_time, pending_onset_conf, \
+           last_confirmed_midi, last_confirmed_time, \
+           current_semitone, pitch_change_count, cooldown_remaining
 
     if status:
         return
@@ -179,7 +200,8 @@ def audio_callback(indata, frames, time_info, status):
         else:
             frames_since_onset = 0
             pending_onset_time = time.time()
-            current_semitone = None
+            pending_onset_conf = conf
+            current_semitone   = None
             pitch_change_count = 0
             print(f"  [onset] detected  f0={f0:.1f} Hz  conf={conf:.2f}")
 
@@ -188,7 +210,6 @@ def audio_callback(indata, frames, time_info, status):
         frames_since_onset += 1
 
         if frames_since_onset >= PITCH_LOOKAHEAD_FRAMES:
-            # Average the valid pitch readings in the lookahead window
             valid = [(f, c) for f, c in pitch_history if f > 0 and c >= MIN_CONFIDENCE
                      and MIN_FREQ <= f <= MAX_FREQ]
 
@@ -197,10 +218,41 @@ def audio_callback(indata, frames, time_info, status):
             if not valid:
                 return  # no reliable pitch detected after onset — skip
 
-            avg_f0 = np.mean([f for f, _ in valid])
-            current_semitone = int(round(hz_to_midi(avg_f0)))  # anchor slur tracker to reliable pitch
-            pitch_change_count = 0
-            on_note_event(hz_to_midi(avg_f0), pending_onset_time)
+            # Pitch stability gate: if readings still spread out, we're mid-transient.
+            midis = [hz_to_midi(f) for f, _ in valid]
+            if len(midis) >= 2 and float(np.std(midis)) > PITCH_STABILITY_TOL:
+                print(f"  [pitch] unstable (std={np.std(midis):.2f} st) — skipping onset")
+                return
+
+            # Weight toward later (more settled) frames: frame index × confidence.
+            weights = [c * (i + 1) for i, (_, c) in enumerate(valid)]
+            avg_f0  = float(np.average([f for f, _ in valid], weights=weights))
+            new_midi = hz_to_midi(avg_f0)
+
+            # Same-pitch time gate: reject bow re-triggers on the same note.
+            now = time.time()
+            if (SAME_PITCH_GATE_S > 0
+                    and last_confirmed_midi is not None
+                    and last_confirmed_time is not None
+                    and abs(new_midi - last_confirmed_midi) < 0.8
+                    and (now - last_confirmed_time) < SAME_PITCH_GATE_S):
+                print(f"  [dbl?] {midi_to_name(int(round(new_midi)))} same as last note, "
+                      f"only {(now - last_confirmed_time)*1000:.0f} ms later — skipping")
+                return
+
+            # Harmonic warning: YIN can lock onto an octave harmonic of the true pitch.
+            if HARMONIC_WARN and last_confirmed_midi is not None:
+                for oct_shift in (12, -12):
+                    if abs(new_midi - (last_confirmed_midi + oct_shift)) < 1.5:
+                        print(f"  [harm?] {midi_to_name(int(round(new_midi)))} may be "
+                              f"{oct_shift:+d} st octave of last note "
+                              f"{midi_to_name(int(round(last_confirmed_midi)))}")
+
+            last_confirmed_midi  = new_midi
+            last_confirmed_time  = now
+            current_semitone     = int(round(new_midi))
+            pitch_change_count   = 0
+            on_note_event(new_midi, pending_onset_time)
             cooldown_remaining = COOLDOWN_FRAMES
 
 # ------------------------
