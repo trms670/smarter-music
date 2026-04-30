@@ -1,0 +1,842 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Smarter Music — Score Follower</title>
+
+  <!-- OpenSheetMusicDisplay — renders MusicXML natively in the browser -->
+  <script src="https://unpkg.com/opensheetmusicdisplay@1.8.6/build/opensheetmusicdisplay.min.js"></script>
+
+  <style>
+    /* ── Reset & base ────────────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:          #0f1117;
+      --surface:     #1a1d27;
+      --border:      #2a2d3e;
+      --accent:      #6c63ff;
+      --accent-glow: rgba(108, 99, 255, 0.25);
+      --locked:      #00d67a;
+      --searching:   #f5a623;
+      --text:        #e8e9f0;
+      --text-dim:    #8b8fa8;
+      --score-bg:    #ffffff;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    /* ── Header ──────────────────────────────────────────────────────────── */
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 20px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+      gap: 16px;
+    }
+
+    .header-title {
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      color: var(--accent);
+      white-space: nowrap;
+    }
+
+    /* Status pill */
+    .status-pill {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 5px 12px;
+      font-size: 12px;
+      transition: border-color 0.2s;
+    }
+    .status-pill.locked   { border-color: var(--locked); }
+    .status-pill.searching{ border-color: var(--searching); }
+
+    .status-dot {
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      background: var(--text-dim);
+      transition: background 0.2s;
+    }
+    .status-pill.locked    .status-dot { background: var(--locked); }
+    .status-pill.searching .status-dot { background: var(--searching);
+                                          animation: pulse 1s infinite; }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; } 50% { opacity: 0.3; }
+    }
+
+    .status-label {
+      color: var(--text-dim);
+      margin-right: 2px;
+    }
+
+    /* Stat items in header */
+    .stat-row {
+      display: flex;
+      gap: 20px;
+      align-items: center;
+    }
+
+    .stat {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      min-width: 52px;
+    }
+
+    .stat-value {
+      font-size: 18px;
+      font-weight: 700;
+      line-height: 1;
+      color: var(--text);
+      transition: color 0.2s;
+    }
+    .stat-value.locked-color { color: var(--locked); }
+
+    .stat-label {
+      font-size: 9px;
+      color: var(--text-dim);
+      letter-spacing: 0.1em;
+      margin-top: 2px;
+      text-transform: uppercase;
+    }
+
+    .divider { width: 1px; height: 28px; background: var(--border); }
+
+    /* Confidence bar */
+    .conf-bar-wrap {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .conf-bar-bg {
+      width: 120px; height: 6px;
+      background: var(--border);
+      border-radius: 3px;
+      overflow: hidden;
+    }
+    .conf-bar-fill {
+      height: 100%;
+      border-radius: 3px;
+      background: var(--text-dim);
+      width: 0%;
+      transition: width 0.3s ease, background 0.3s;
+    }
+    .conf-bar-fill.locked   { background: var(--locked); }
+    .conf-bar-fill.searching{ background: var(--searching); }
+
+    .conf-pct {
+      font-size: 12px;
+      min-width: 30px;
+      text-align: right;
+    }
+
+    /* Note heard */
+    .note-heard {
+      font-size: 12px;
+      color: var(--text-dim);
+    }
+    .note-heard span { color: var(--text); font-weight: 600; }
+
+    /* ── Main layout ─────────────────────────────────────────────────────── */
+    .main {
+      display: flex;
+      flex: 1;
+      overflow: hidden;
+    }
+
+    /* ── Score panel ─────────────────────────────────────────────────────── */
+    .score-panel {
+      flex: 1;
+      overflow-y: auto;
+      background: var(--score-bg);
+      position: relative;
+      padding: 16px;
+    }
+
+    #osmd-container {
+      position: relative;
+    }
+
+    /* OSMD's default cursor is a thin line — we override it to a wider
+       highlight box via CSS injected after OSMD initialises. */
+    .osmd-cursor {
+      background: rgba(108, 99, 255, 0.18) !important;
+      border-left: 3px solid rgba(108, 99, 255, 0.9) !important;
+      border-right: 3px solid rgba(108, 99, 255, 0.9) !important;
+      border-radius: 2px !important;
+    }
+
+
+    /* ── Sidebar ─────────────────────────────────────────────────────────── */
+    .sidebar {
+      width: 240px;
+      background: var(--surface);
+      border-left: 1px solid var(--border);
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      overflow-y: auto;
+      flex-shrink: 0;
+    }
+
+    .sidebar h3 {
+      font-size: 10px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 6px;
+    }
+
+    .sidebar-stat {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+    .sidebar-stat-label {
+      font-size: 10px;
+      color: var(--text-dim);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .sidebar-stat-value {
+      font-size: 28px;
+      font-weight: 700;
+      color: var(--text);
+      line-height: 1;
+    }
+    .sidebar-stat-value.accent { color: var(--accent); }
+
+    /* Mini progress strip — one cell per measure */
+    .progress-grid {
+      display: grid;
+      grid-template-columns: repeat(8, 1fr);
+      gap: 3px;
+    }
+    .prog-cell {
+      aspect-ratio: 1;
+      border-radius: 2px;
+      background: var(--border);
+      font-size: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--text-dim);
+      transition: background 0.2s, color 0.2s;
+      cursor: default;
+    }
+    .prog-cell.active {
+      background: var(--accent);
+      color: #fff;
+    }
+    .prog-cell.locked-active {
+      background: var(--locked);
+      color: #000;
+    }
+
+    /* Activity log */
+    .activity-log {
+      flex: 1;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column-reverse;
+      gap: 5px;
+      min-height: 0;
+    }
+    .log-entry {
+      font-size: 12px;
+      padding: 7px 10px;
+      border-radius: 4px;
+      background: var(--bg);
+      border-left: 3px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+    .log-entry.locked  { border-color: var(--locked); }
+    .log-entry.search  { border-color: var(--searching); }
+
+    /* most-recent entry gets a brighter style */
+    .log-entry:first-child {
+      background: color-mix(in srgb, var(--accent) 10%, var(--bg));
+      border-color: var(--accent);
+    }
+    .log-entry:first-child.locked  { background: color-mix(in srgb, var(--locked) 10%, var(--bg)); border-color: var(--locked); }
+    .log-entry:first-child.search  { background: color-mix(in srgb, var(--searching) 10%, var(--bg)); border-color: var(--searching); }
+
+    .log-pos   { color: var(--text); font-weight: 600; white-space: nowrap; }
+    .log-note  { color: var(--accent); font-weight: 700; font-size: 14px; }
+    .log-conf  { color: var(--text-dim); font-size: 11px; white-space: nowrap; }
+
+    /* ── Loading overlay ─────────────────────────────────────────────────── */
+    #loading-overlay {
+      position: fixed; inset: 0;
+      background: var(--bg);
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      gap: 16px; z-index: 100;
+      transition: opacity 0.4s;
+    }
+    #loading-overlay.hidden { opacity: 0; pointer-events: none; }
+
+    .loader-ring {
+      width: 48px; height: 48px;
+      border: 3px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .loader-text { font-size: 13px; color: var(--text-dim); }
+    .loader-sub  { font-size: 11px; color: var(--text-dim); opacity: 0.6; }
+  </style>
+</head>
+<body>
+
+<!-- Loading overlay -->
+<div id="loading-overlay">
+  <div class="loader-ring"></div>
+  <div class="loader-text">Loading score…</div>
+  <div class="loader-sub">OpenSheetMusicDisplay is rendering the MusicXML</div>
+</div>
+
+<!-- Header -->
+<header>
+  <div class="header-title">SMARTER MUSIC &nbsp;/&nbsp; Bach Minuet in G</div>
+
+  <div class="stat-row">
+    <div id="status-pill" class="status-pill">
+      <div class="status-dot"></div>
+      <span class="status-label">status</span>
+      <span id="status-text">waiting</span>
+    </div>
+
+    <div class="divider"></div>
+
+    <div class="stat">
+      <div class="stat-value" id="stat-measure">—</div>
+      <div class="stat-label">measure</div>
+    </div>
+    <div class="stat">
+      <div class="stat-value" id="stat-beat">—</div>
+      <div class="stat-label">beat</div>
+    </div>
+
+    <div class="divider"></div>
+
+    <div class="conf-bar-wrap">
+      <div class="conf-bar-bg">
+        <div class="conf-bar-fill" id="conf-bar"></div>
+      </div>
+      <div class="conf-pct" id="conf-pct">—</div>
+    </div>
+
+    <div class="divider"></div>
+
+    <div class="stat">
+      <div class="stat-value" id="stat-bpm">—</div>
+      <div class="stat-label">bpm</div>
+    </div>
+
+    <div class="divider"></div>
+
+    <div class="note-heard">heard <span id="stat-note">—</span></div>
+  </div>
+</header>
+
+<!-- Main area -->
+<div class="main">
+
+  <!-- Score panel -->
+  <div class="score-panel" id="score-panel">
+    <div id="osmd-container">
+      <div id="osmd-score"></div>
+    </div>
+  </div>
+
+  <!-- Sidebar -->
+  <div class="sidebar">
+    <h3>Position</h3>
+    <div class="sidebar-stat">
+      <div class="sidebar-stat-label">Measure</div>
+      <div class="sidebar-stat-value accent" id="sb-measure">—</div>
+    </div>
+    <div class="sidebar-stat">
+      <div class="sidebar-stat-label">Beat</div>
+      <div class="sidebar-stat-value" id="sb-beat">—</div>
+    </div>
+
+    <h3>Tempo</h3>
+    <div class="sidebar-stat">
+      <div class="sidebar-stat-label">BPM</div>
+      <div class="sidebar-stat-value" id="sb-bpm">—</div>
+    </div>
+
+    <h3>Measures ({{ total_measures }})</h3>
+    <div class="progress-grid" id="progress-grid">
+      {% for m in range(1, total_measures + 1) %}
+        <div class="prog-cell" id="pc-{{ m }}" title="Measure {{ m }}">{{ m }}</div>
+      {% endfor %}
+    </div>
+
+    <h3>Log</h3>
+    <div class="activity-log" id="activity-log"></div>
+  </div>
+
+</div>
+
+<script>
+// ── OSMD initialisation ──────────────────────────────────────────────────────
+
+const OSMD = opensheetmusicdisplay.OpenSheetMusicDisplay;
+
+const osmd = new OSMD("osmd-score", {
+  autoResize: true,
+  backend: "svg",
+  drawTitle: true,
+  drawSubtitle: true,
+  drawComposer: true,
+  drawLyricist: false,
+  // Show the OSMD cursor (vertical highlight bar at current note)
+  drawFromMeasureNumber: 1,
+  // Render all measures on one page (scrollable, no page breaks)
+  pageFormat: "Endless",
+  // Lighten cursor colour — we overlay our own measure highlight too
+  cursorOptions: [{
+    type: 0,                          // standard note cursor
+    color: "#6c63ff",
+    alpha: 0.15,
+    follow: false,
+  }],
+});
+
+// measureFirstStep: 1-based measure → first cursor step (for scroll / highlight)
+// noteSteps[i]    : cursor step for the i-th non-rest note in the score
+//                   index aligns with `expected` from score.py (0-based, 127 notes)
+const measureFirstStep  = {};
+const noteSteps         = [];   // fallback: noteSteps[expected_idx] = osmd cursor step
+const stepByMeasureBeat = {};   // primary: stepByMeasureBeat[measure][beatKey] = cursor step
+
+// ── Note-vs-rest detection ────────────────────────────────────────────────────
+// OSMD's API varies slightly across releases; try each tier in order.
+
+function _cursorStepIsNote() {
+  // Tier 1: GNotesUnderCursor() — recommended public API.
+  // Returns [] on rests in most OSMD versions; non-empty on notes.
+  try {
+    const gNotes = osmd.cursor.GNotesUnderCursor();
+    if (gNotes !== undefined) {
+      if (gNotes.length === 0) return false;
+      // Extra guard: check sourceNote.isRest (bool property or method)
+      const allRests = gNotes.every(gn => {
+        const sn = gn.sourceNote;
+        if (!sn) return false; // no sourceNote → treat as note
+        const ir = sn.isRest;
+        return (typeof ir === "function") ? ir() : !!ir;
+      });
+      return !allRests;
+    }
+  } catch (_) {}
+
+  // Tier 2: iterator.CurrentVoiceEntries — internal but stable since OSMD 0.6.
+  try {
+    const entries = osmd.cursor.iterator.CurrentVoiceEntries;
+    if (entries && entries.length > 0) {
+      for (const ve of entries) {
+        for (const n of (ve.Notes || [])) {
+          const ir = n.isRest;
+          if (!((typeof ir === "function") ? ir() : !!ir)) return true;
+        }
+      }
+      return false; // all entries were rests
+    }
+  } catch (_) {}
+
+  // Tier 3: assume note (safe default — Bach Minuet has no rests)
+  return true;
+}
+
+async function initScore() {
+  try {
+    await osmd.load("/score.mxl");
+    osmd.render();
+
+    // Walk every cursor position once, building all three maps simultaneously.
+    osmd.cursor.show();
+    osmd.cursor.reset();
+    let step = 0;
+    let prevMIdx = -1;
+    let measureStartTs = 0;
+    let stepWithinMeasure = 0;
+
+    while (!osmd.cursor.iterator.endReached) {
+      const mIdx = osmd.cursor.iterator.currentMeasureIndex; // 0-based
+      const m    = mIdx + 1;                                 // 1-based
+
+      // Track when we enter a new measure
+      if (mIdx !== prevMIdx) { stepWithinMeasure = 0; prevMIdx = mIdx; }
+      else { stepWithinMeasure++; }
+
+      if (!(m in measureFirstStep)) measureFirstStep[m] = step;
+
+      // Resolve the within-measure beat offset (quarter notes from measure start).
+      // Try OSMD's iterator timestamp first; fall back to a running step counter
+      // (accurate when every step is one 8th note, which holds for Bach Minuet).
+      let beatOffset = null;
+      try {
+        const ts = osmd.cursor.iterator.currentTimestamp;
+        if (ts != null) {
+          const globalTs = (typeof ts.realValue === "number") ? ts.realValue
+                         : (typeof ts.RealValue === "number") ? ts.RealValue
+                         : null;
+          if (globalTs != null) {
+            if (measureStartTs === 0 && stepWithinMeasure === 0) measureStartTs = globalTs;
+            if (stepWithinMeasure === 0) measureStartTs = globalTs;
+            beatOffset = Math.round((globalTs - measureStartTs) * 8) / 8;
+          }
+        }
+      } catch (_) {}
+
+      // Fallback: each cursor step in the Bach Minuet is one 8th note (0.5 QN)
+      if (beatOffset === null) beatOffset = Math.round(stepWithinMeasure * 0.5 * 8) / 8;
+
+      const beatKey = beatOffset.toFixed(3);
+      if (!stepByMeasureBeat[m]) stepByMeasureBeat[m] = {};
+      if (!(beatKey in stepByMeasureBeat[m])) stepByMeasureBeat[m][beatKey] = step;
+
+      if (_cursorStepIsNote()) noteSteps.push(step);
+
+      osmd.cursor.next();
+      step++;
+    }
+
+    const mbCount = Object.values(stepByMeasureBeat).reduce((s, m) => s + Object.keys(m).length, 0);
+    console.log(
+      `[OSMD] cursor walk done: ${step} total steps, `
+      + `${noteSteps.length} note steps, `
+      + `${mbCount} measure+beat positions across ${Object.keys(stepByMeasureBeat).length} measures`
+    );
+
+    // If detection found nothing (API mismatch), fall back: treat every step
+    // as a note position. Bach Minuet has no rests so this is still correct.
+    if (noteSteps.length === 0) {
+      console.warn("[OSMD] note detection found 0 steps — falling back to all-steps mapping");
+      osmd.cursor.reset();
+      step = 0;
+      while (!osmd.cursor.iterator.endReached) {
+        noteSteps.push(step++);
+        osmd.cursor.next();
+      }
+    }
+
+    // Reset cursor to beginning
+    currentCursorStep = 0;
+    osmd.cursor.reset();
+
+    // Build measure bounding boxes from OSMD's graphic sheet
+    buildMeasureBoxes();
+
+    // Hide loading overlay
+    document.getElementById("loading-overlay").classList.add("hidden");
+
+    // Fetch initial state from server and apply it
+    fetch("/state")
+      .then(r => r.json())
+      .then(applyUpdate)
+      .catch(() => {});
+
+    // Start SSE
+    startSSE();
+
+  } catch (err) {
+    document.querySelector(".loader-text").textContent = "Failed to load score";
+    document.querySelector(".loader-sub").textContent = String(err);
+    console.error(err);
+  }
+}
+
+// ── Measure bounding boxes ───────────────────────────────────────────────────
+// OSMD stores measure positions in its GraphicSheet. We extract pixel
+// coordinates for each measure so we can position our highlight overlay.
+
+const measureBoxes = {};  // measure_num (1-based) → {x, y, w, h} in px
+
+function buildMeasureBoxes() {
+  try {
+    const sheet = osmd.GraphicSheet;
+    if (!sheet) return;
+
+    // osmd.zoom converts from OSMD "tenths" units to pixels.
+    // In OSMD the zoom is applied as a CSS transform on the SVG, and
+    // unitInPixels converts sheet units to SVG units before the transform.
+    const unitInPx = osmd.zoom * 10; // 10 units per staff space
+
+    // Iterate through OSMD's MeasureList: array of arrays [staffMeasures]
+    const measureList = sheet.MeasureList;
+    if (!measureList) return;
+
+    measureList.forEach((staffMeasures, idx) => {
+      if (!staffMeasures || staffMeasures.length === 0) return;
+      const gMeasure = staffMeasures[0];
+      if (!gMeasure || !gMeasure.PositionAndShape) return;
+
+      const ps = gMeasure.PositionAndShape;
+      const absPos = ps.AbsolutePosition || ps.absolutePosition;
+      const size   = ps.Size || ps.size;
+      if (!absPos || !size) return;
+
+      // Compute pixel coordinates relative to the OSMD SVG element
+      measureBoxes[idx + 1] = {
+        x: absPos.x * unitInPx,
+        y: absPos.y * unitInPx,
+        w: size.width  * unitInPx,
+        h: size.height * unitInPx,
+      };
+    });
+  } catch (e) {
+    // Measurement is best-effort; highlight will gracefully be invisible
+    console.warn("buildMeasureBoxes:", e);
+  }
+}
+
+// ── Highlight overlay ────────────────────────────────────────────────────────
+
+const scorePanelEl = document.getElementById("score-panel");
+const osmdContainerEl = document.getElementById("osmd-container");
+let currentHighlightMeasure = null;
+
+function scrollToMeasure(measure) {
+  const box = measureBoxes[measure];
+  if (!box) return;
+
+  const svg = osmdContainerEl.querySelector("svg");
+  if (!svg) return;
+
+  const svgRect = svg.getBoundingClientRect();
+  const panelRect = scorePanelEl.getBoundingClientRect();
+  const scale = svgRect.width / (parseFloat(svg.getAttribute("width")) || 1);
+  const absY = (svgRect.top - panelRect.top) + scorePanelEl.scrollTop + box.y * scale;
+
+  // Scroll so the measure is in the middle of the panel viewport
+  const targetScroll = absY - scorePanelEl.clientHeight / 2;
+  scorePanelEl.scrollTo({ top: targetScroll, behavior: "smooth" });
+}
+
+// ── OSMD cursor navigation ───────────────────────────────────────────────────
+
+let pendingCursorStep = null;   // queued target step; null = nothing pending
+let cursorBusy        = false;
+let currentCursorStep = 0;      // tracks where the OSMD cursor currently sits
+
+function jumpCursorToNote(idx, measure, beat) {
+  let targetStep = null;
+
+  // ── Primary: measure + beat lookup (immune to manually-inserted note mismatch)
+  if (measure != null && beat != null) {
+    const beatOffset = Math.round((beat - 1.0) * 8) / 8; // convert 1-based → 0-based QN
+    const beatKey    = beatOffset.toFixed(3);
+    const byMeasure  = stepByMeasureBeat[measure];
+    if (byMeasure) {
+      if (beatKey in byMeasure) {
+        targetStep = byMeasure[beatKey];
+      } else {
+        // Find nearest recorded beat in this measure (handles floating-point drift)
+        let bestDelta = Infinity;
+        for (const k of Object.keys(byMeasure)) {
+          const d = Math.abs(parseFloat(k) - beatOffset);
+          if (d < bestDelta) { bestDelta = d; targetStep = byMeasure[k]; }
+        }
+        if (bestDelta > 0.5) targetStep = null; // too far off — give up
+      }
+    }
+  }
+
+  // ── Fallback 1: noteSteps[idx] (works when measures match, i.e. measures 1-24)
+  if (targetStep === null && idx != null && idx < noteSteps.length) {
+    targetStep = noteSteps[idx];
+  }
+
+  // ── Fallback 2: start of the detected measure
+  if (targetStep === null) {
+    targetStep = measureFirstStep[measure ?? currentHighlightMeasure] ?? 0;
+  }
+
+  pendingCursorStep = targetStep;
+  if (!cursorBusy) _doCursorJump();
+}
+
+function _doCursorJump() {
+  if (pendingCursorStep === null) { cursorBusy = false; return; }
+  cursorBusy = true;
+  const targetStep   = pendingCursorStep;
+  pendingCursorStep  = null;
+
+  // Jump backward: reset to step 0 first (HMM may jump back on soft-resets)
+  if (targetStep < currentCursorStep) {
+    osmd.cursor.reset();
+    currentCursorStep = 0;
+  }
+
+  // Already there — just repaint and drain the queue.
+  if (currentCursorStep === targetStep) {
+    osmd.cursor.update();
+    _doCursorJump();
+    return;
+  }
+
+  // Advance forward in batches of animation frames.
+  // 64 steps/frame comfortably covers the whole score in one frame (~1 ms).
+  function advance() {
+    const batchSize = 64;
+    for (let i = 0; i < batchSize; i++) {
+      if (currentCursorStep >= targetStep || osmd.cursor.iterator.endReached) break;
+      osmd.cursor.next();
+      currentCursorStep++;
+    }
+    if (currentCursorStep < targetStep && !osmd.cursor.iterator.endReached) {
+      requestAnimationFrame(advance);
+    } else {
+      osmd.cursor.update();
+      _doCursorJump(); // drain any jump that arrived while we were busy
+    }
+  }
+
+  requestAnimationFrame(advance);
+}
+
+// ── UI update ────────────────────────────────────────────────────────────────
+
+let activePcCell = null;
+
+function applyUpdate(data) {
+  const { measure, beat, confidence, locked, bpm, note_name, idx } = data;
+  const confPct = Math.round((confidence || 0) * 100);
+  const statusClass = locked ? "locked" : "searching";
+  const statusText  = locked ? "LOCKED" : "searching";
+
+  // Header stats
+  document.getElementById("stat-measure").textContent = measure ?? "—";
+  document.getElementById("stat-beat").textContent    = beat != null ? beat.toFixed(1) : "—";
+  document.getElementById("stat-bpm").textContent     = bpm  != null ? Math.round(bpm) : "—";
+  document.getElementById("stat-note").textContent    = note_name ?? "—";
+  document.getElementById("conf-pct").textContent     = confPct + "%";
+
+  const statusPill = document.getElementById("status-pill");
+  statusPill.className = "status-pill " + statusClass;
+  document.getElementById("status-text").textContent = statusText;
+
+  const confBar = document.getElementById("conf-bar");
+  confBar.style.width = confPct + "%";
+  confBar.className   = "conf-bar-fill " + statusClass;
+
+  // Sidebar
+  document.getElementById("sb-measure").textContent = measure ?? "—";
+  document.getElementById("sb-beat").textContent    = beat != null ? beat.toFixed(1) : "—";
+  document.getElementById("sb-bpm").textContent     = bpm  != null ? Math.round(bpm) : "—";
+
+  // Progress grid
+  if (activePcCell) {
+    activePcCell.className = "prog-cell";
+  }
+  const pcCell = document.getElementById("pc-" + measure);
+  if (pcCell) {
+    pcCell.className = "prog-cell " + (locked ? "locked-active" : "active");
+    activePcCell = pcCell;
+  }
+
+  // OSMD cursor: jump to the exact detected note on every event
+  jumpCursorToNote(idx, measure, beat);
+
+  // Scroll to follow the cursor when the measure changes
+  if (measure != null && measure !== currentHighlightMeasure) {
+    scrollToMeasure(measure);
+    currentHighlightMeasure = measure;
+  }
+
+  // Activity log
+  addLogEntry(data);
+}
+
+// ── Activity log ─────────────────────────────────────────────────────────────
+
+const MAX_LOG_ENTRIES = 25;
+
+function addLogEntry(data) {
+  const log = document.getElementById("activity-log");
+  const { measure, beat, confidence, locked, note_name } = data;
+  const confPct = Math.round((confidence || 0) * 100);
+
+  const entry = document.createElement("div");
+  entry.className = "log-entry " + (locked ? "locked" : "search");
+
+  entry.innerHTML =
+    `<span class="log-pos">m${measure} &middot; beat ${(beat||0).toFixed(1)}</span>`
+    + `<span class="log-note">${note_name || "?"}</span>`
+    + `<span class="log-conf">${confPct}%</span>`;
+
+  log.prepend(entry);
+
+  while (log.childElementCount > MAX_LOG_ENTRIES) {
+    log.removeChild(log.lastChild);
+  }
+}
+
+// ── Server-Sent Events ───────────────────────────────────────────────────────
+
+function startSSE() {
+  const evtSource = new EventSource("/events");
+
+  evtSource.onmessage = (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      applyUpdate(data);
+    } catch (err) {
+      console.warn("SSE parse error:", err);
+    }
+  };
+
+  evtSource.onerror = () => {
+    // Reconnect automatically — browsers do this by default for SSE
+    console.warn("SSE connection lost, browser will retry…");
+  };
+}
+
+// ── Resize handler ───────────────────────────────────────────────────────────
+// When the window is resized, OSMD reflows the score. We rebuild boxes
+// and reposition the highlight.
+
+let resizeTimer = null;
+window.addEventListener("resize", () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => buildMeasureBoxes(), 300);
+});
+
+// ── Boot ─────────────────────────────────────────────────────────────────────
+initScore();
+</script>
+</body>
+</html>

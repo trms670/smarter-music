@@ -6,9 +6,7 @@ import time
 
 from score import expected
 
-# ------------------------
-# Pitch utilities
-# ------------------------
+
 def hz_to_midi(f_hz: float) -> float:
     return 69.0 + 12.0 * math.log2(f_hz / 440.0)
 
@@ -16,18 +14,14 @@ def midi_to_name(m: int) -> str:
     names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
     return f"{names[m % 12]}{m // 12 - 1}"
 
-# ------------------------
-# Alignment parameters
-# ------------------------
-PITCH_TOL_SEMITONES = 0.5     # allow +/- 0.5 semitone (adjust later)
-HOLD_CONFIRM_FRAMES = 3       # how many frames must match before advancing
-MIN_CONFIDENCE = 0.80         # aubio confidence threshold
-MIN_FREQ = 80                 # violin low G is ~196; keep low bound safe
-MAX_FREQ = 1400               # around E6~1319; safe upper
 
-# ------------------------
-# Audio / aubio params
-# ------------------------
+PITCH_TOL_SEMITONES = 0.5     
+HOLD_CONFIRM_FRAMES = 3       
+MIN_CONFIDENCE = 0.80         
+MIN_FREQ = 80                 
+MAX_FREQ = 1400               
+
+
 SAMPLE_RATE = 44100
 HOP_SIZE = 512
 BUFFER_SIZE = 2048
@@ -36,9 +30,7 @@ pitch_o = aubio.pitch("yin", BUFFER_SIZE, HOP_SIZE, SAMPLE_RATE)
 pitch_o.set_unit("Hz")
 pitch_o.set_silence(-40)      # dB threshold
 
-# ------------------------
-# Simple alignment state
-# ------------------------
+
 idx = 0
 confirm = 0
 

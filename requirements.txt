@@ -1,13 +1,6 @@
-# Audio capture
 sounddevice
-
-# Real-time pitch and onset detection
 aubio
-
-# Score parsing and music analysis
 music21
-
-# Numerical computing (used throughout)
 numpy
-
-partitura
+flask
+matplotlib

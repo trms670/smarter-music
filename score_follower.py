@@ -35,48 +35,36 @@ import numpy as np
 
 from score import expected
 
-# ─── Tuning constants ──────────────────────────────────────────────────────────
-BEAM_K          = 25      # number of beam hypotheses
+# Tuning constants
+BEAM_K          = 25 
 
-SIGMA_PITCH     = 1.0     # semitone width for pitch emission
+SIGMA_PITCH     = 1.0 
 
-USE_IOI         = True    # weight by inter-onset interval as well as pitch
-IOI_WEIGHT      = 0.6     # scale factor applied to IOI log-prob (pitch weight = 1.0)
-SIGMA_IOI_REL   = 0.20    # IOI sigma as fraction of expected IOI (tighter = 0.20,
-                           #   looser = 0.40; use ~0.20 with fixed BPM, ~0.35 adaptive)
-SIGMA_IOI_FLOOR = 0.07    # minimum IOI sigma in seconds (floor for very short notes)
+USE_IOI         = True    
+IOI_WEIGHT      = 0.6    
+SIGMA_IOI_REL   = 0.35    
+SIGMA_IOI_FLOOR = 0.07  
 
-# Tempo — set FIXED_BPM to a number to lock tempo (e.g. 108.0 for a metronome demo).
-# Set to None to use the adaptive EMA tracker.
-FIXED_BPM       = 90.0    # e.g. 108.0
-INIT_BPM        = 100.0   # starting tempo when adaptive (or as FIXED_BPM fallback)
-TEMPO_ALPHA     = 0.20    # EMA weight for adaptive updates (lower = smoother)
+# Tempo
+FIXED_BPM       = None    
+INIT_BPM        = 100.0  
+TEMPO_ALPHA     = 0.20 
 
-# Pause / reset thresholds
-PAUSE_SOFT_RESET_S = 1.5  # gap ≥ this → widen beams + skip IOI (performer may have moved)
-SILENCE_RESET_S    = 5.0  # gap ≥ this → full hard reset
+PAUSE_SOFT_RESET_S = 1.5  
+SILENCE_RESET_S    = 5.0  
 
-# Display stability: position shown to the user only updates when confidence is
-# at or above this level.  Below it the last locked position is held.
-# Set to 0.0 to always show the raw top-beam position (more jittery).
+# Display stability
 DISPLAY_MIN_CONF = 0.55
 
-LOG_CONF_THRESH  = -20.0  # best raw log-prob below this → inject global beams
+LOG_CONF_THRESH  = -20.0 
 
-# N-gram context window: retroactively score the last CONTEXT_SIZE-1 observations
-# against expected notes before the candidate state, weighted by CONTEXT_DECAY^k.
-# Example with CONTEXT_SIZE=3, DECAY=0.5:
-#   score(ns) += 0.5 * pitch_lp(obs[-2], ns-1) + 0.25 * pitch_lp(obs[-3], ns-2)
-# This makes sequences like (D5→G4→A4) far more unique than D5 alone.
-CONTEXT_SIZE   = 3    # number of recent notes used (1 = current only, no context)
-CONTEXT_DECAY  = 0.5  # weight halves per step back in history
-CONTEXT_WEIGHT = 0.8  # overall scale on context log-prob (pitch weight = 1.0)
+# N-gram context window
+CONTEXT_SIZE   = 3  
+CONTEXT_DECAY  = 0.5 
+CONTEXT_WEIGHT = 0.8  
 
-# ─── Transition model ──────────────────────────────────────────────────────────
-# (delta_steps, unnormalised_weight)
-# More inertial than before: higher stay/+1 weights, smaller backward weights.
-# This biases the model to stay near the current position and requires strong
-# evidence before jumping far.
+# ransition model
+
 _RAW_TRANS = [
     (-3, 0.002),
     (-2, 0.005),
@@ -84,22 +72,21 @@ _RAW_TRANS = [
     ( 0, 0.080),   # stay: repeated note or pitch-detector glitch
     ( 1, 0.620),   # advance one note: normal playing
     ( 2, 0.150),   # skip one note: missed detection
-    ( 3, 0.070),   # skip two notes
-    ( 4, 0.030),   # skip three notes
-    ( 5, 0.018),   # skip four notes
-    ( 6, 0.010),   # skip five notes
+    ( 3, 0.070),   
+    ( 4, 0.030),   
+    ( 5, 0.018),   
+    ( 6, 0.010),   
 ]
 _W_TOT       = sum(w for _, w in _RAW_TRANS)
 _TRANSITIONS = [(d, np.log(w / _W_TOT)) for d, w in _RAW_TRANS]
 
-# ─── Pre-computed score arrays ─────────────────────────────────────────────────
 _N    = len(expected)
 _MIDI = np.array([e["pitches_midi"][0] for e in expected], dtype=np.float64)
 _DUR  = np.array([e["duration_q"]      for e in expected], dtype=np.float64)
 
-_NO_PREV = -1   # sentinel: beam has no predecessor state (just initialised)
+_NO_PREV = -1   
 
-# ─── Emission helpers ──────────────────────────────────────────────────────────
+# Emission helpers
 def _pitch_lp_state(midi_obs: float, s: int) -> float:
     diff = abs(midi_obs - _MIDI[s])
     return -(diff * diff) / (2.0 * SIGMA_PITCH * SIGMA_PITCH)
@@ -110,7 +97,7 @@ def _pitch_lp_all(midi_obs: float) -> np.ndarray:
     return -(diff * diff) / (2.0 * SIGMA_PITCH * SIGMA_PITCH)
 
 
-# ─── Adaptive tempo tracker ────────────────────────────────────────────────────
+# Adaptive tempo tracker
 class _Tempo:
     def __init__(self, bpm: float) -> None:
         self.qps: float = bpm / 60.0   # quarter-notes per second
@@ -126,26 +113,8 @@ class _Tempo:
         return self.qps * 60.0
 
 
-# ─── ScoreFollower ─────────────────────────────────────────────────────────────
+# ScoreFollower
 class ScoreFollower:
-    """
-    Online beam-search score follower.
-
-    Interface
-    ---------
-    follower = ScoreFollower(expected)
-    result   = follower.observe(midi_pitch, time.time())
-
-    result keys
-    -----------
-    idx        – displayed index into `expected` (confidence-gated; see locked)
-    measure    – displayed measure number (1-based)
-    beat       – displayed beat within that measure
-    confidence – soft-max probability of the raw top beam ∈ (0, 1]
-    locked     – True if displayed position is a high-confidence estimate;
-                 False if we're still searching (showing last good position or best guess)
-    bpm        – current tempo estimate
-    """
 
     def __init__(self, score_events: list, beam_k: int = BEAM_K) -> None:
         self._score  = score_events
@@ -168,7 +137,6 @@ class ScoreFollower:
         # Sliding window of recent MIDI observations for N-gram context scoring
         self._obs_buf: deque = deque(maxlen=CONTEXT_SIZE)
 
-    # ── Public API ─────────────────────────────────────────────────────────────
 
     def reset(self) -> None:
         """Discard all hypotheses and reinitialise on the next observation."""
@@ -191,7 +159,6 @@ class ScoreFollower:
         with self._lock:
             return self._observe_locked(midi_est, timestamp)
 
-    # ── Core logic (called under lock) ─────────────────────────────────────────
 
     def _observe_locked(self, midi_est: float, timestamp: float) -> dict:
         obs_ioi   = 0.0
@@ -209,7 +176,7 @@ class ScoreFollower:
                 obs_ioi = gap
         self._last_ts = timestamp
 
-        # Cold start: score every state by pitch alone, keep top K
+        # Cold start
         if not self._ready:
             log_emit    = _pitch_lp_all(midi_est)
             top_idx     = np.argsort(log_emit)[-self._k:][::-1]
@@ -218,7 +185,7 @@ class ScoreFollower:
             self._obs_buf.append(midi_est)
             return self._build_report()
 
-        # Soft reset: past context is stale — clear it, then widen the beam.
+        # Soft reset
         if soft_reset:
             self._obs_buf.clear()
             self._inject_global(midi_est)
@@ -268,7 +235,7 @@ class ScoreFollower:
 
         return self._build_report()
 
-    # ── N-gram context emission ────────────────────────────────────────────────
+    # N-gram context emission
 
     def _context_lp(self, ns: int) -> float:
         """
@@ -296,7 +263,7 @@ class ScoreFollower:
             weight *= CONTEXT_DECAY
         return total
 
-    # ── IOI emission ───────────────────────────────────────────────────────────
+    # IOI emission
 
     def _ioi_lp(self, obs_ioi: float, prev_s: int, delta: int) -> float:
         """Log-probability of the observed IOI for the transition prev_s → prev_s+delta."""
@@ -329,7 +296,6 @@ class ScoreFollower:
         best_lp  = sorted_m[0][1][0]
         self._beams = [[s, lp - best_lp, ps] for s, (lp, ps) in sorted_m[:self._k]]
 
-    # ── Report builder ─────────────────────────────────────────────────────────
 
     def _build_report(self) -> dict:
         if not self._beams:
@@ -360,8 +326,6 @@ class ScoreFollower:
             "bpm":        self._tempo.bpm,
         }
 
-    # ── Internal reset (no lock — always called while already holding it) ──────
-
     def _reset_state(self) -> None:
         self._beams       = []
         self._ready       = False
@@ -372,5 +336,4 @@ class ScoreFollower:
         self._tempo       = _Tempo(init_bpm)
 
 
-# ─── Module-level singleton ────────────────────────────────────────────────────
 follower = ScoreFollower(expected)

@@ -1,0 +1,12 @@
+__pycache__/
+.venv/
+.DS_Store
+bpm_plot.pdf
+confidence_plot.pdf
+confidence_multi.pdf
+navigation_plot.pdf
+jump_test.txt
+nav_test.txt
+run1.txt
+run2.txt
+run3.txt
